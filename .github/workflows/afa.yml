@@ -2,8 +2,8 @@ name: afa
 
 on:
   schedule:
-    # JST(日本時間)の平日 19:03 に実行 = UTC 10:03
-    - cron: "3 10 * * 1-5"
+    # JST(日本時間)の 19:03 に実行 = UTC 10:03
+    - cron: "3 10 * * *"
   workflow_dispatch:
 
 # GitへのPush（空コミット）を行うために必要な権限
