@@ -26,6 +26,7 @@ RANDOM_STATE = 42
 MAX_RETRIES = 2
 RETRY_SLEEP_SECONDS = 2
 PROGRESS_EVERY = 100
+MARKET_CAP_DIVISOR = 100_000_000
 
 EXCLUDED_SECTORS = {
     "銀行業",
@@ -129,7 +130,8 @@ def normalize_label(value: str) -> str:
 
 
 def is_valid_code(value: str) -> bool:
-    return bool(re.fullmatch(r"\d{4}", str(value).strip()))
+    code = str(value).strip().upper()
+    return bool(re.fullmatch(r"(?:\d{4}|\d{3}[A-Z])", code))
 
 
 def load_config() -> dict:
@@ -269,6 +271,7 @@ def choose_financial_as_of(date_map: dict[str, str | None]) -> str:
 
 
 def fetch_ticker_payload(code: str) -> dict:
+    code = str(code).strip().upper()
     ticker = yf.Ticker(f"{code}.T")
 
     history_df = call_with_retry(ticker.history, period="5d", auto_adjust=False)
@@ -344,6 +347,20 @@ def to_float_or_nan(value):
         return np.nan
     try:
         return float(value)
+    except Exception:  # noqa: BLE001
+        return np.nan
+
+
+def to_oku_or_nan(value):
+    if value is None:
+        return np.nan
+    try:
+        if pd.isna(value):
+            return np.nan
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return float(value) / MARKET_CAP_DIVISOR
     except Exception:  # noqa: BLE001
         return np.nan
 
@@ -538,8 +555,8 @@ def dataframe_to_sheet_rows(df: pd.DataFrame) -> list[list]:
             format_cell(row.get("status")),
             format_cell(row.get("error")),
             format_cell(row.get("price")),
-            format_cell(row.get("actual_market_cap")),
-            format_cell(row.get("predicted_market_cap")),
+            format_cell(to_oku_or_nan(row.get("actual_market_cap"))),
+            format_cell(to_oku_or_nan(row.get("predicted_market_cap"))),
             format_cell(row.get("residual_log")),
             format_cell(row.get("mispricing_ratio")),
             format_cell(row.get("data_quality")),
@@ -571,13 +588,14 @@ def main() -> None:
     enriched_rows = []
 
     for i, row in enumerate(input_rows, start=1):
-        code = row["code"]
+        code = str(row["code"]).strip().upper()
+        row["code"] = code
         sector = row["sector"]
         normalized_sector = normalize_text(sector)
 
         if not is_valid_code(code):
             row["status"] = "入力不正"
-            row["error"] = "A列が4桁コードではありません"
+            row["error"] = "A列が4桁数字または3桁+英字ではありません"
             enriched_rows.append(row)
             if i % PROGRESS_EVERY == 0 or i == total_rows:
                 log(f"INFO fetch {i}/{total_rows} {summarize_status_counts(enriched_rows)}")
