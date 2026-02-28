@@ -2,8 +2,13 @@ name: afa
 
 on:
   schedule:
-    - cron: "23 7 * * 1-5"
+    # JST(日本時間)の平日 19:03 に実行 = UTC 10:03
+    - cron: "3 10 * * 1-5"
   workflow_dispatch:
+
+# GitへのPush（空コミット）を行うために必要な権限
+permissions:
+  contents: write
 
 jobs:
   run:
@@ -13,6 +18,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 全コミット履歴を取得（最終コミット日時の判定に必須）
+          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -26,3 +34,25 @@ jobs:
 
       - name: Run script
         run: python main.py
+
+      - name: Prevent 60-day workflow suspension
+        run: |
+          # 最終コミットのUNIXタイムスタンプを取得
+          last_commit_time=$(git log -1 --format=%ct)
+          # 現在のUNIXタイムスタンプを取得
+          current_time=$(date +%s)
+          # 差分を日数に変換 (1日 = 86400秒)
+          diff_days=$(( (current_time - last_commit_time) / 86400 ))
+          
+          echo "最終更新から ${diff_days} 日経過しています。"
+          
+          # 50日以上経過している場合のみ空コミットを実行
+          if [ "$diff_days" -ge 50 ]; then
+            echo "50日以上経過しているため、ワークフロー停止回避の空コミットを作成します。"
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keep alive to prevent workflow suspension"
+            git push
+          else
+            echo "空コミットは不要です。"
+          fi
