@@ -25,6 +25,7 @@ ALPHAS = [0.1, 1, 10, 100, 1000]
 RANDOM_STATE = 42
 MAX_RETRIES = 2
 RETRY_SLEEP_SECONDS = 2
+PROGRESS_EVERY = 100
 
 EXCLUDED_SECTORS = {
     "銀行業",
@@ -98,6 +99,17 @@ WARNING_SECTOR = "不動産業"
 
 def log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def safe_exc_name(exc: Exception) -> str:
+    return type(exc).__name__
+
+
+def summarize_status_counts(rows: list[dict]) -> str:
+    counts = Counter(row.get("status", "") for row in rows)
+    keys = ["OK", "除外業種", "データ不足", "入力不正", "学習失敗"]
+    parts = [f"{k}={counts.get(k, 0)}" for k in keys if counts.get(k, 0) > 0]
+    return ", ".join(parts) if parts else "status=0"
 
 
 def normalize_text(value: str) -> str:
@@ -549,12 +561,15 @@ def main() -> None:
 
     input_rows = read_input_rows(ws)
     if not input_rows:
-        log("No input rows found. Nothing to do.")
+        log("INFO start rows=0 result=no_input")
         return
 
-    log(f"Input rows: {len(input_rows)}")
+    total_rows = len(input_rows)
+    log(f"INFO start rows={total_rows}")
 
+    excluded_sector_norms = {normalize_text(x) for x in EXCLUDED_SECTORS}
     enriched_rows = []
+
     for i, row in enumerate(input_rows, start=1):
         code = row["code"]
         sector = row["sector"]
@@ -564,9 +579,11 @@ def main() -> None:
             row["status"] = "入力不正"
             row["error"] = "A列が4桁コードではありません"
             enriched_rows.append(row)
+            if i % PROGRESS_EVERY == 0 or i == total_rows:
+                log(f"INFO fetch {i}/{total_rows} {summarize_status_counts(enriched_rows)}")
             continue
 
-        if normalized_sector in {normalize_text(x) for x in EXCLUDED_SECTORS}:
+        if normalized_sector in excluded_sector_norms:
             row["status"] = "除外業種"
             row["error"] = "金融系業種のため学習対象外"
         else:
@@ -588,9 +605,10 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             if row["status"] != "除外業種":
                 row["status"] = "データ不足"
-                row["error"] = f"yfinance取得失敗: {type(exc).__name__}"
+                row["error"] = f"yfinance取得失敗: {safe_exc_name(exc)}"
             enriched_rows.append(row)
-            log(f"[{i}/{len(input_rows)}] {code} failed: {type(exc).__name__}")
+            if i % PROGRESS_EVERY == 0 or i == total_rows:
+                log(f"INFO fetch {i}/{total_rows} {summarize_status_counts(enriched_rows)}")
             continue
 
         if row["status"] != "除外業種":
@@ -605,7 +623,9 @@ def main() -> None:
                 row["error"] = ""
 
         enriched_rows.append(row)
-        log(f"[{i}/{len(input_rows)}] {code} -> {row['status']}")
+
+        if i % PROGRESS_EVERY == 0 or i == total_rows:
+            log(f"INFO fetch {i}/{total_rows} {summarize_status_counts(enriched_rows)}")
 
     df = build_dataframe(enriched_rows)
 
@@ -617,6 +637,8 @@ def main() -> None:
     train_n = int(len(train_df))
 
     if train_n >= MIN_TRAIN_N:
+        log(f"INFO train start train_n={train_n}")
+
         train_df["sector"] = train_df["sector"].astype(str)
         x_train, x_pred, _ = make_design_matrix(train_df, train_df)
         y_train = np.log(train_df["actual_market_cap"].astype(float).values)
@@ -650,6 +672,11 @@ def main() -> None:
             df.at[original_idx, "mispricing_ratio"] = float(r["mispricing_ratio"])
             df.at[original_idx, "overall_rank"] = float(r["overall_rank"])
             df.at[original_idx, "sector_rank"] = float(r["sector_rank"])
+
+        log(
+            f"INFO train done train_n={train_n} alpha={best_alpha} "
+            f"r2={model_r2:.6f} mae={model_mae:.6f}"
+        )
     else:
         for idx, row in df.iterrows():
             if row["status"] == "OK":
@@ -662,6 +689,8 @@ def main() -> None:
         df["overall_rank"] = np.nan
         df["sector_rank"] = np.nan
 
+        log(f"WARN train skipped train_n={train_n} min_required={MIN_TRAIN_N}")
+
     df["model_r2"] = model_r2
     df["model_mae"] = model_mae
     df["train_n"] = train_n
@@ -671,11 +700,22 @@ def main() -> None:
     end_row = start_row + len(output_rows) - 1
     write_range = f"D{start_row}:S{end_row}"
 
+    log(f"INFO sheet write range={write_range} rows={len(output_rows)}")
     ws.batch_clear(["D2:S"])
     ws.update(write_range, output_rows, value_input_option="USER_ENTERED")
 
-    counts = df["status"].value_counts(dropna=False).to_dict()
-    log(f"Done. status_counts={counts}, TrainN={train_n}, R2={model_r2}, MAE={model_mae}")
+    status_summary = summarize_status_counts(enriched_rows if train_n >= MIN_TRAIN_N else df.to_dict("records"))
+    if pd.isna(model_r2):
+        r2_text = "NA"
+    else:
+        r2_text = f"{model_r2:.6f}"
+
+    if pd.isna(model_mae):
+        mae_text = "NA"
+    else:
+        mae_text = f"{model_mae:.6f}"
+
+    log(f"INFO done {status_summary}, train_n={train_n}, r2={r2_text}, mae={mae_text}")
 
 
 if __name__ == "__main__":
