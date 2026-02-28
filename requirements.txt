@@ -1,0 +1,8 @@
+yfinance
+pandas
+numpy
+scikit-learn
+gspread
+google-auth
+requests
+urllib3
