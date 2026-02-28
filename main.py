@@ -4,6 +4,7 @@ import os
 import re
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -11,12 +12,15 @@ import gspread
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from gspread.utils import rowcol_to_a1
 from sklearn.linear_model import Ridge
-from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.model_selection import KFold
 
 JST = ZoneInfo("Asia/Tokyo")
-TODAY_JST = datetime.now(JST).strftime("%Y-%m-%d")
+NOW_JST = datetime.now(JST)
+TODAY_JST = NOW_JST.strftime("%Y-%m-%d")
+IS_SUNDAY_JST = NOW_JST.weekday() == 6
 
 APP_SECRET_ENV = "APP_SECRET_JSON"
 MIN_TRAIN_N = 300
@@ -27,6 +31,10 @@ MAX_RETRIES = 2
 RETRY_SLEEP_SECONDS = 2
 PROGRESS_EVERY = 100
 MARKET_CAP_DIVISOR = 100_000_000
+PRICE_BATCH_SIZE = 8
+MAX_WORKERS = 8
+CACHE_TTL_DAYS = 7
+CACHE_START_COL = 20  # T列
 
 EXCLUDED_SECTORS = {
     "銀行業",
@@ -97,6 +105,36 @@ LOG1P_FEATURES = [
 ZERO_FILL_FEATURES = {"capex", "dividends_paid"}
 WARNING_SECTOR = "不動産業"
 
+BS_FEATURE_KEYS = [
+    "total_assets",
+    "total_liabilities",
+    "equity",
+    "cash",
+    "current_assets",
+    "current_liabilities",
+    "intangible_assets",
+]
+PL_FEATURE_KEYS = [
+    "revenue",
+    "gross_profit",
+    "operating_income",
+    "net_income",
+]
+CF_FEATURE_KEYS = [
+    "operating_cf",
+    "capex",
+    "dividends_paid",
+]
+MIN_FEATURE_COUNT = math.ceil(DATA_QUALITY_THRESHOLD * len(RAW_FEATURE_KEYS))
+
+CACHE_HEADERS = [
+    "CacheCode",
+    "CacheUpdatedAt",
+    "CacheFinancialAsOf",
+    "CacheDataQuality",
+    "CacheFreeCf",
+] + [f"Cache_{key}" for key in RAW_FEATURE_KEYS]
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -158,6 +196,50 @@ def open_worksheet(config: dict):
     return sh.worksheet(config["worksheet_name"])
 
 
+def get_cell(raw_row: list[str], idx: int) -> str:
+    if idx < len(raw_row):
+        return raw_row[idx].strip()
+    return ""
+
+
+def parse_optional_float(value: str):
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return float(value)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def parse_cache_from_row(raw_row: list[str]) -> dict | None:
+    start_idx = CACHE_START_COL - 1
+    cache_code = get_cell(raw_row, start_idx)
+    cache_updated_at = get_cell(raw_row, start_idx + 1)
+    cache_financial_as_of = get_cell(raw_row, start_idx + 2)
+    cache_data_quality = parse_optional_float(get_cell(raw_row, start_idx + 3))
+    cache_free_cf = parse_optional_float(get_cell(raw_row, start_idx + 4))
+
+    raw_values = {}
+    any_value = False
+    for i, key in enumerate(RAW_FEATURE_KEYS):
+        value = parse_optional_float(get_cell(raw_row, start_idx + 5 + i))
+        raw_values[key] = value
+        if value is not None:
+            any_value = True
+
+    if not cache_code and not cache_updated_at and not any_value and cache_free_cf is None:
+        return None
+
+    return {
+        "code": cache_code,
+        "updated_at": cache_updated_at,
+        "financial_as_of": cache_financial_as_of,
+        "data_quality": cache_data_quality,
+        "free_cf": cache_free_cf,
+        "raw_values": raw_values,
+    }
+
+
 def read_input_rows(ws) -> list[dict]:
     values = ws.get_all_values()
     if not values:
@@ -165,10 +247,9 @@ def read_input_rows(ws) -> list[dict]:
 
     rows = []
     for idx, raw_row in enumerate(values[1:], start=2):
-        padded = raw_row + [""] * (3 - len(raw_row))
-        code = padded[0].strip()
-        name = padded[1].strip()
-        sector = padded[2].strip()
+        code = get_cell(raw_row, 0)
+        name = get_cell(raw_row, 1)
+        sector = get_cell(raw_row, 2)
 
         if not code and not name and not sector:
             continue
@@ -182,6 +263,7 @@ def read_input_rows(ws) -> list[dict]:
                 "status": "",
                 "error": "",
                 "notes": "",
+                "cache": parse_cache_from_row(raw_row),
             }
         )
 
@@ -212,6 +294,61 @@ def extract_latest_price(history_df: pd.DataFrame) -> tuple[float | None, str | 
     price = float(close_series.iloc[-1])
     price_date = pd.Timestamp(last_idx).strftime("%Y-%m-%d")
     return price, price_date
+
+
+def chunked(items: list[str], size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def fetch_batch_prices(codes: list[str]) -> dict[str, tuple[float | None, str]]:
+    results = {code: (None, "") for code in codes}
+    if not codes:
+        return results
+
+    tickers = [f"{code}.T" for code in codes]
+
+    try:
+        batch_df = call_with_retry(
+            yf.download,
+            tickers=tickers,
+            period="5d",
+            auto_adjust=False,
+            progress=False,
+            group_by="ticker",
+            threads=False,
+        )
+    except Exception:  # noqa: BLE001
+        return results
+
+    if batch_df is None or batch_df.empty:
+        return results
+
+    if isinstance(batch_df.columns, pd.MultiIndex):
+        top_level = set(str(x) for x in batch_df.columns.get_level_values(0))
+        for code in codes:
+            ticker_key = f"{code}.T"
+            if ticker_key in top_level:
+                sub_df = batch_df[ticker_key]
+            elif code in top_level:
+                sub_df = batch_df[code]
+            else:
+                continue
+            price, dt = extract_latest_price(sub_df)
+            results[code] = (price, dt or "")
+    else:
+        if len(codes) == 1:
+            price, dt = extract_latest_price(batch_df)
+            results[codes[0]] = (price, dt or "")
+
+    return results
+
+
+def fetch_all_batch_prices(codes: list[str]) -> dict[str, tuple[float | None, str]]:
+    price_map = {}
+    for code_chunk in chunked(codes, PRICE_BATCH_SIZE):
+        price_map.update(fetch_batch_prices(code_chunk))
+    return price_map
 
 
 def pick_info_number(info: dict, keys: list[str]) -> float | None:
@@ -270,12 +407,122 @@ def choose_financial_as_of(date_map: dict[str, str | None]) -> str:
     return counter.most_common(1)[0][0]
 
 
-def fetch_ticker_payload(code: str) -> dict:
+def count_available_features(raw_values: dict) -> int:
+    return sum(raw_values.get(k) is not None for k in RAW_FEATURE_KEYS)
+
+
+def build_financial_payload(raw_values: dict, raw_dates: dict) -> dict:
+    operating_cf = raw_values.get("operating_cf")
+    capex = raw_values.get("capex")
+    free_cf = None
+    if operating_cf is not None and capex is not None:
+        if capex < 0:
+            free_cf = operating_cf + capex
+        else:
+            free_cf = operating_cf - capex
+
+    data_quality_count = count_available_features(raw_values)
+    data_quality = data_quality_count / len(RAW_FEATURE_KEYS)
+
+    return {
+        "financial_as_of": choose_financial_as_of(raw_dates),
+        "data_quality": data_quality,
+        "raw_values": raw_values,
+        "free_cf": free_cf,
+    }
+
+
+def build_cache_write(code: str, financial_payload: dict, updated_at: str) -> dict:
+    return {
+        "code": code,
+        "updated_at": updated_at,
+        "financial_as_of": financial_payload.get("financial_as_of", ""),
+        "data_quality": financial_payload.get("data_quality"),
+        "free_cf": financial_payload.get("free_cf"),
+        "raw_values": dict(financial_payload.get("raw_values", {})),
+    }
+
+
+def has_cache_data(cache_payload: dict | None) -> bool:
+    if not cache_payload:
+        return False
+    if cache_payload.get("free_cf") is not None:
+        return True
+    raw_values = cache_payload.get("raw_values", {})
+    return any(raw_values.get(k) is not None for k in RAW_FEATURE_KEYS)
+
+
+def is_cache_fresh(updated_at: str) -> bool:
+    if not updated_at:
+        return False
+    try:
+        updated_date = datetime.strptime(updated_at, "%Y-%m-%d").date()
+    except Exception:  # noqa: BLE001
+        return False
+    delta_days = (NOW_JST.date() - updated_date).days
+    return 0 <= delta_days <= CACHE_TTL_DAYS
+
+
+def normalize_cache_for_code(code: str, cache_payload: dict | None) -> dict | None:
+    if not cache_payload:
+        return None
+    cache_code = str(cache_payload.get("code", "")).strip().upper()
+    if cache_code != code:
+        return None
+    return cache_payload
+
+
+def fetch_financial_payload(ticker) -> dict:
+    raw_values = {key: None for key in RAW_FEATURE_KEYS}
+    raw_dates = {key: None for key in RAW_FEATURE_KEYS}
+
+    bs = call_with_retry(lambda: ticker.balance_sheet)
+    for feature in BS_FEATURE_KEYS:
+        value, dt = statement_value(bs, RAW_FEATURE_SPECS[feature])
+        raw_values[feature] = value
+        raw_dates[feature] = dt
+
+    current_count = count_available_features(raw_values)
+    if current_count + len(PL_FEATURE_KEYS) + len(CF_FEATURE_KEYS) < MIN_FEATURE_COUNT:
+        return build_financial_payload(raw_values, raw_dates)
+
+    fin = call_with_retry(lambda: ticker.financials)
+    for feature in PL_FEATURE_KEYS:
+        value, dt = statement_value(fin, RAW_FEATURE_SPECS[feature])
+        raw_values[feature] = value
+        raw_dates[feature] = dt
+
+    current_count = count_available_features(raw_values)
+    if current_count + len(CF_FEATURE_KEYS) < MIN_FEATURE_COUNT:
+        return build_financial_payload(raw_values, raw_dates)
+
+    cf = call_with_retry(lambda: ticker.cashflow)
+    for feature in CF_FEATURE_KEYS:
+        value, dt = statement_value(cf, RAW_FEATURE_SPECS[feature])
+        raw_values[feature] = value
+        raw_dates[feature] = dt
+
+    return build_financial_payload(raw_values, raw_dates)
+
+
+def fetch_ticker_payload(
+    code: str,
+    price_hint: float | None = None,
+    quote_as_of_hint: str = "",
+    cache_payload: dict | None = None,
+    force_refresh: bool = False,
+) -> dict:
     code = str(code).strip().upper()
+    cache_payload = normalize_cache_for_code(code, cache_payload)
+
     ticker = yf.Ticker(f"{code}.T")
 
-    history_df = call_with_retry(ticker.history, period="5d", auto_adjust=False)
-    price, quote_as_of = extract_latest_price(history_df)
+    price = price_hint
+    quote_as_of = quote_as_of_hint or ""
+
+    if price is None:
+        history_df = call_with_retry(ticker.history, period="5d", auto_adjust=False)
+        price, quote_as_of = extract_latest_price(history_df)
 
     info = {}
     try:
@@ -292,54 +539,90 @@ def fetch_ticker_payload(code: str) -> dict:
     if actual_market_cap is None and price is not None and shares is not None:
         actual_market_cap = float(price) * float(shares)
 
-    try:
-        bs = call_with_retry(lambda: ticker.balance_sheet)
-    except Exception:  # noqa: BLE001
-        bs = pd.DataFrame()
+    if cache_payload and not force_refresh and is_cache_fresh(cache_payload.get("updated_at", "")) and has_cache_data(cache_payload):
+        cached_financial_payload = {
+            "financial_as_of": cache_payload.get("financial_as_of", ""),
+            "data_quality": cache_payload.get("data_quality", 0.0) or 0.0,
+            "raw_values": dict(cache_payload.get("raw_values", {})),
+            "free_cf": cache_payload.get("free_cf"),
+        }
+        return {
+            "price": price,
+            "actual_market_cap": actual_market_cap,
+            "quote_as_of": quote_as_of or "",
+            "financial_as_of": cached_financial_payload["financial_as_of"],
+            "data_quality": cached_financial_payload["data_quality"],
+            "raw_values": cached_financial_payload["raw_values"],
+            "free_cf": cached_financial_payload["free_cf"],
+            "cache_write": cache_payload,
+        }
+
+    if actual_market_cap is None or actual_market_cap <= 0:
+        if cache_payload and has_cache_data(cache_payload):
+            cached_financial_payload = {
+                "financial_as_of": cache_payload.get("financial_as_of", ""),
+                "data_quality": cache_payload.get("data_quality", 0.0) or 0.0,
+                "raw_values": dict(cache_payload.get("raw_values", {})),
+                "free_cf": cache_payload.get("free_cf"),
+            }
+            return {
+                "price": price,
+                "actual_market_cap": actual_market_cap,
+                "quote_as_of": quote_as_of or "",
+                "financial_as_of": cached_financial_payload["financial_as_of"],
+                "data_quality": cached_financial_payload["data_quality"],
+                "raw_values": cached_financial_payload["raw_values"],
+                "free_cf": cached_financial_payload["free_cf"],
+                "cache_write": cache_payload,
+            }
+
+        empty_raw_values = {key: None for key in RAW_FEATURE_KEYS}
+        return {
+            "price": price,
+            "actual_market_cap": actual_market_cap,
+            "quote_as_of": quote_as_of or "",
+            "financial_as_of": "",
+            "data_quality": 0.0,
+            "raw_values": empty_raw_values,
+            "free_cf": None,
+            "cache_write": cache_payload if cache_payload else None,
+        }
 
     try:
-        fin = call_with_retry(lambda: ticker.financials)
+        financial_payload = fetch_financial_payload(ticker)
+        cache_write = None
+        if has_cache_data({"raw_values": financial_payload["raw_values"], "free_cf": financial_payload["free_cf"]}):
+            cache_write = build_cache_write(code, financial_payload, TODAY_JST)
+
+        return {
+            "price": price,
+            "actual_market_cap": actual_market_cap,
+            "quote_as_of": quote_as_of or "",
+            "financial_as_of": financial_payload["financial_as_of"],
+            "data_quality": financial_payload["data_quality"],
+            "raw_values": financial_payload["raw_values"],
+            "free_cf": financial_payload["free_cf"],
+            "cache_write": cache_write,
+        }
     except Exception:  # noqa: BLE001
-        fin = pd.DataFrame()
-
-    try:
-        cf = call_with_retry(lambda: ticker.cashflow)
-    except Exception:  # noqa: BLE001
-        cf = pd.DataFrame()
-
-    raw_values = {}
-    raw_dates = {}
-    for feature, candidates in RAW_FEATURE_SPECS.items():
-        if feature in {"revenue", "gross_profit", "operating_income", "net_income"}:
-            value, dt = statement_value(fin, candidates)
-        elif feature in {"operating_cf", "capex", "dividends_paid"}:
-            value, dt = statement_value(cf, candidates)
-        else:
-            value, dt = statement_value(bs, candidates)
-        raw_values[feature] = value
-        raw_dates[feature] = dt
-
-    operating_cf = raw_values.get("operating_cf")
-    capex = raw_values.get("capex")
-    free_cf = None
-    if operating_cf is not None and capex is not None:
-        if capex < 0:
-            free_cf = operating_cf + capex
-        else:
-            free_cf = operating_cf - capex
-
-    data_quality_count = sum(raw_values.get(k) is not None for k in RAW_FEATURE_KEYS)
-    data_quality = data_quality_count / len(RAW_FEATURE_KEYS)
-
-    return {
-        "price": price,
-        "actual_market_cap": actual_market_cap,
-        "quote_as_of": quote_as_of or "",
-        "financial_as_of": choose_financial_as_of(raw_dates),
-        "data_quality": data_quality,
-        "raw_values": raw_values,
-        "free_cf": free_cf,
-    }
+        if cache_payload and has_cache_data(cache_payload):
+            cached_financial_payload = {
+                "financial_as_of": cache_payload.get("financial_as_of", ""),
+                "data_quality": cache_payload.get("data_quality", 0.0) or 0.0,
+                "raw_values": dict(cache_payload.get("raw_values", {})),
+                "free_cf": cache_payload.get("free_cf"),
+            }
+            return {
+                "price": price,
+                "actual_market_cap": actual_market_cap,
+                "quote_as_of": quote_as_of or "",
+                "financial_as_of": cached_financial_payload["financial_as_of"],
+                "data_quality": cached_financial_payload["data_quality"],
+                "raw_values": cached_financial_payload["raw_values"],
+                "free_cf": cached_financial_payload["free_cf"],
+                "cache_write": cache_payload,
+            }
+        raise
 
 
 def to_float_or_nan(value):
@@ -401,15 +684,9 @@ def apply_imputation(train_df: pd.DataFrame, full_df: pd.DataFrame, feature_cols
             full[col] = full[col].fillna(0.0)
             continue
 
-        train_sector_medians = train.groupby("sector", dropna=False)[col].median()
-        full[col] = full.apply(
-            lambda r: train_sector_medians.get(r["sector"], np.nan) if pd.isna(r[col]) else r[col],
-            axis=1,
-        )
-        train[col] = train.apply(
-            lambda r: train_sector_medians.get(r["sector"], np.nan) if pd.isna(r[col]) else r[col],
-            axis=1,
-        )
+        sector_medians = train.groupby("sector", dropna=False)[col].median()
+        train[col] = train[col].fillna(train["sector"].map(sector_medians))
+        full[col] = full[col].fillna(full["sector"].map(sector_medians))
 
         global_median = train[col].median()
         train[col] = train[col].fillna(global_median)
@@ -572,6 +849,93 @@ def dataframe_to_sheet_rows(df: pd.DataFrame) -> list[list]:
     return rows
 
 
+def cache_to_sheet_rows(rows: list[dict]) -> list[list]:
+    out_rows = []
+    for row in rows:
+        cache_write = row.get("cache_write")
+        if not has_cache_data(cache_write):
+            out_rows.append([""] * len(CACHE_HEADERS))
+            continue
+
+        raw_values = cache_write.get("raw_values", {})
+        out_rows.append([
+            format_cell(cache_write.get("code")),
+            format_cell(cache_write.get("updated_at")),
+            format_cell(cache_write.get("financial_as_of")),
+            format_cell(cache_write.get("data_quality")),
+            format_cell(cache_write.get("free_cf")),
+            *[format_cell(raw_values.get(key)) for key in RAW_FEATURE_KEYS],
+        ])
+    return out_rows
+
+
+def enrich_row(
+    row: dict,
+    excluded_sector_norms: set[str],
+    price_map: dict[str, tuple[float | None, str]],
+    force_refresh_cache: bool,
+) -> dict:
+    row = dict(row)
+    code = str(row["code"]).strip().upper()
+    row["code"] = code
+    sector = row["sector"]
+    normalized_sector = normalize_text(sector)
+    row["cache_write"] = row.get("cache")
+
+    if not is_valid_code(code):
+        row["status"] = "入力不正"
+        row["error"] = "A列が4桁数字または3桁+英字ではありません"
+        row["cache_write"] = None
+        return row
+
+    if normalized_sector in excluded_sector_norms:
+        row["status"] = "除外業種"
+        row["error"] = "金融系業種のため学習対象外"
+    else:
+        row["status"] = "取得中"
+
+    if normalized_sector == normalize_text(WARNING_SECTOR):
+        row["notes"] = "注意業種"
+
+    price_hint, quote_hint = price_map.get(code, (None, ""))
+
+    try:
+        payload = fetch_ticker_payload(
+            code=code,
+            price_hint=price_hint,
+            quote_as_of_hint=quote_hint,
+            cache_payload=row.get("cache"),
+            force_refresh=force_refresh_cache,
+        )
+        row["price"] = payload["price"]
+        row["actual_market_cap"] = payload["actual_market_cap"]
+        row["quote_as_of"] = payload["quote_as_of"]
+        row["financial_as_of"] = payload["financial_as_of"]
+        row["data_quality"] = payload["data_quality"]
+        for feature in RAW_FEATURE_KEYS:
+            row[feature] = payload["raw_values"].get(feature)
+        row["free_cf"] = payload["free_cf"]
+        row["cache_write"] = payload.get("cache_write")
+    except Exception as exc:  # noqa: BLE001
+        if row["status"] != "除外業種":
+            row["status"] = "データ不足"
+            row["error"] = f"yfinance取得失敗: {safe_exc_name(exc)}"
+        return row
+
+    if row["status"] != "除外業種":
+        if row.get("actual_market_cap") is None or row.get("actual_market_cap", 0) <= 0:
+            row["status"] = "データ不足"
+            row["error"] = "実時価総額を取得できません"
+        elif row.get("data_quality", 0) < DATA_QUALITY_THRESHOLD:
+            row["status"] = "データ不足"
+            row["error"] = f"DataQuality不足(<{DATA_QUALITY_THRESHOLD:.2f})"
+        else:
+            row["status"] = "OK"
+            row["error"] = ""
+
+    return row
+
+
 def main() -> None:
     config = load_config()
     ws = open_worksheet(config)
@@ -584,66 +948,35 @@ def main() -> None:
     total_rows = len(input_rows)
     log(f"INFO start rows={total_rows}")
 
+    valid_codes = []
+    for row in input_rows:
+        code = str(row["code"]).strip().upper()
+        if is_valid_code(code):
+            valid_codes.append(code)
+
+    log(f"INFO price_batch start codes={len(valid_codes)} batch_size={PRICE_BATCH_SIZE}")
+    price_map = fetch_all_batch_prices(valid_codes)
+    log("INFO price_batch done")
+
     excluded_sector_norms = {normalize_text(x) for x in EXCLUDED_SECTORS}
     enriched_rows = []
 
-    for i, row in enumerate(input_rows, start=1):
-        code = str(row["code"]).strip().upper()
-        row["code"] = code
-        sector = row["sector"]
-        normalized_sector = normalize_text(sector)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(
+                enrich_row,
+                row,
+                excluded_sector_norms,
+                price_map,
+                IS_SUNDAY_JST,
+            )
+            for row in input_rows
+        ]
 
-        if not is_valid_code(code):
-            row["status"] = "入力不正"
-            row["error"] = "A列が4桁数字または3桁+英字ではありません"
-            enriched_rows.append(row)
+        for i, future in enumerate(futures, start=1):
+            enriched_rows.append(future.result())
             if i % PROGRESS_EVERY == 0 or i == total_rows:
                 log(f"INFO fetch {i}/{total_rows} {summarize_status_counts(enriched_rows)}")
-            continue
-
-        if normalized_sector in excluded_sector_norms:
-            row["status"] = "除外業種"
-            row["error"] = "金融系業種のため学習対象外"
-        else:
-            row["status"] = "取得中"
-
-        if normalized_sector == normalize_text(WARNING_SECTOR):
-            row["notes"] = "注意業種"
-
-        try:
-            payload = fetch_ticker_payload(code)
-            row["price"] = payload["price"]
-            row["actual_market_cap"] = payload["actual_market_cap"]
-            row["quote_as_of"] = payload["quote_as_of"]
-            row["financial_as_of"] = payload["financial_as_of"]
-            row["data_quality"] = payload["data_quality"]
-            for feature in RAW_FEATURE_KEYS:
-                row[feature] = payload["raw_values"].get(feature)
-            row["free_cf"] = payload["free_cf"]
-        except Exception as exc:  # noqa: BLE001
-            if row["status"] != "除外業種":
-                row["status"] = "データ不足"
-                row["error"] = f"yfinance取得失敗: {safe_exc_name(exc)}"
-            enriched_rows.append(row)
-            if i % PROGRESS_EVERY == 0 or i == total_rows:
-                log(f"INFO fetch {i}/{total_rows} {summarize_status_counts(enriched_rows)}")
-            continue
-
-        if row["status"] != "除外業種":
-            if row.get("actual_market_cap") is None or row.get("actual_market_cap", 0) <= 0:
-                row["status"] = "データ不足"
-                row["error"] = "実時価総額を取得できません"
-            elif row.get("data_quality", 0) < DATA_QUALITY_THRESHOLD:
-                row["status"] = "データ不足"
-                row["error"] = f"DataQuality不足(<{DATA_QUALITY_THRESHOLD:.2f})"
-            else:
-                row["status"] = "OK"
-                row["error"] = ""
-
-        enriched_rows.append(row)
-
-        if i % PROGRESS_EVERY == 0 or i == total_rows:
-            log(f"INFO fetch {i}/{total_rows} {summarize_status_counts(enriched_rows)}")
 
     df = build_dataframe(enriched_rows)
 
@@ -718,9 +1051,16 @@ def main() -> None:
     end_row = start_row + len(output_rows) - 1
     write_range = f"D{start_row}:S{end_row}"
 
+    cache_rows = cache_to_sheet_rows(enriched_rows)
+    cache_end_col = CACHE_START_COL + len(CACHE_HEADERS) - 1
+    cache_header_range = f"{rowcol_to_a1(1, CACHE_START_COL)}:{rowcol_to_a1(1, cache_end_col)}"
+    cache_write_range = f"{rowcol_to_a1(start_row, CACHE_START_COL)}:{rowcol_to_a1(end_row, cache_end_col)}"
+
     log(f"INFO sheet write range={write_range} rows={len(output_rows)}")
     ws.batch_clear(["D2:S"])
     ws.update(write_range, output_rows, value_input_option="USER_ENTERED")
+    ws.update(cache_header_range, [CACHE_HEADERS], value_input_option="USER_ENTERED")
+    ws.update(cache_write_range, cache_rows, value_input_option="USER_ENTERED")
 
     status_summary = summarize_status_counts(enriched_rows if train_n >= MIN_TRAIN_N else df.to_dict("records"))
     if pd.isna(model_r2):
