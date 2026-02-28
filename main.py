@@ -44,8 +44,6 @@ EXCLUDED_SECTORS = {
 }
 
 OUTPUT_COLUMNS = [
-    "Status",
-    "Error",
     "Price",
     "ActualMarketCap",
     "PredictedMarketCap",
@@ -60,6 +58,8 @@ OUTPUT_COLUMNS = [
     "ModelMAE",
     "TrainN",
     "Notes",
+    "Status",
+    "Error",
 ]
 
 RAW_FEATURE_SPECS = {
@@ -829,8 +829,6 @@ def dataframe_to_sheet_rows(df: pd.DataFrame) -> list[list]:
     rows = []
     for _, row in df.iterrows():
         rows.append([
-            format_cell(row.get("status")),
-            format_cell(row.get("error")),
             format_cell(row.get("price")),
             format_cell(to_oku_or_nan(row.get("actual_market_cap"))),
             format_cell(to_oku_or_nan(row.get("predicted_market_cap"))),
@@ -845,6 +843,8 @@ def dataframe_to_sheet_rows(df: pd.DataFrame) -> list[list]:
             format_cell(row.get("model_mae")),
             format_cell(row.get("train_n")),
             format_cell(row.get("notes")),
+            format_cell(row.get("status")),
+            format_cell(row.get("error")),
         ])
     return rows
 
