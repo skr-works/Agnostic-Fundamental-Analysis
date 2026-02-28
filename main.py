@@ -32,7 +32,8 @@ RETRY_SLEEP_SECONDS = 2
 PROGRESS_EVERY = 100
 MARKET_CAP_DIVISOR = 100_000_000
 PRICE_BATCH_SIZE = 8
-MAX_WORKERS = 8
+MAX_WORKERS = 4  # 8→4に削減してCrumb失効を緩和
+ENRICH_BATCH_SIZE = 200  # バッチサイズ: この件数ごとにセッションをリセット
 CACHE_TTL_DAYS = 7
 CACHE_START_COL = 20  # T列
 
@@ -270,6 +271,28 @@ def read_input_rows(ws) -> list[dict]:
     return rows
 
 
+def reset_yfinance_session() -> None:
+    """yfinanceのグローバルセッションとCrumbキャッシュをリセットする。"""
+    try:
+        yf.utils.get_yf_logger()  # ロガー初期化（副作用なし、import確認用）
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # yfinance内部のセッションキャッシュをクリアする
+        if hasattr(yf.utils, "_curlfile"):
+            yf.utils._curlfile = None
+        cache = getattr(yf.utils, "_CRUMB_CACHE", None)
+        if cache is not None and hasattr(cache, "clear"):
+            cache.clear()
+        # requests_cache使用時はセッション自体を再生成
+        session = getattr(yf, "_requests_cache_session", None)
+        if session is not None and hasattr(session, "close"):
+            session.close()
+        yf.utils.requests = __import__("requests")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def call_with_retry(func, *args, **kwargs):
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -278,6 +301,10 @@ def call_with_retry(func, *args, **kwargs):
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt < MAX_RETRIES:
+                # 401(Crumb失効)の場合はセッションリセットを挟む
+                exc_str = str(exc)
+                if "401" in exc_str or "Unauthorized" in exc_str or "Invalid Crumb" in exc_str:
+                    reset_yfinance_session()
                 time.sleep(RETRY_SLEEP_SECONDS)
     raise last_exc
 
@@ -960,23 +987,33 @@ def main() -> None:
 
     excluded_sector_norms = {normalize_text(x) for x in EXCLUDED_SECTORS}
     enriched_rows = []
+    processed = 0
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [
-            executor.submit(
-                enrich_row,
-                row,
-                excluded_sector_norms,
-                price_map,
-                IS_SUNDAY_JST,
-            )
-            for row in input_rows
-        ]
+    # ENRICH_BATCH_SIZE件ごとにバッチを区切り、バッチ間でセッションをリセットする
+    for batch_start in range(0, total_rows, ENRICH_BATCH_SIZE):
+        batch = input_rows[batch_start:batch_start + ENRICH_BATCH_SIZE]
 
-        for i, future in enumerate(futures, start=1):
-            enriched_rows.append(future.result())
-            if i % PROGRESS_EVERY == 0 or i == total_rows:
-                log(f"INFO fetch {i}/{total_rows} {summarize_status_counts(enriched_rows)}")
+        if batch_start > 0:
+            reset_yfinance_session()
+            log(f"INFO session reset at row={batch_start}")
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [
+                executor.submit(
+                    enrich_row,
+                    row,
+                    excluded_sector_norms,
+                    price_map,
+                    IS_SUNDAY_JST,
+                )
+                for row in batch
+            ]
+
+            for future in futures:
+                enriched_rows.append(future.result())
+                processed += 1
+                if processed % PROGRESS_EVERY == 0 or processed == total_rows:
+                    log(f"INFO fetch {processed}/{total_rows} {summarize_status_counts(enriched_rows)}")
 
     df = build_dataframe(enriched_rows)
 
@@ -1058,9 +1095,9 @@ def main() -> None:
 
     log(f"INFO sheet write range={write_range} rows={len(output_rows)}")
     ws.batch_clear(["D2:S"])
-    ws.update(write_range, output_rows, value_input_option="USER_ENTERED")
-    ws.update(cache_header_range, [CACHE_HEADERS], value_input_option="USER_ENTERED")
-    ws.update(cache_write_range, cache_rows, value_input_option="USER_ENTERED")
+    ws.update(values=output_rows, range_name=write_range, value_input_option="USER_ENTERED")
+    ws.update(values=[CACHE_HEADERS], range_name=cache_header_range, value_input_option="USER_ENTERED")
+    ws.update(values=cache_rows, range_name=cache_write_range, value_input_option="USER_ENTERED")
 
     status_summary = summarize_status_counts(enriched_rows if train_n >= MIN_TRAIN_N else df.to_dict("records"))
     if pd.isna(model_r2):
