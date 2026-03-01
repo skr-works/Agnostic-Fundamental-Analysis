@@ -4,7 +4,6 @@ import os
 import re
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -977,6 +976,9 @@ def main() -> None:
     excluded_sector_norms = {normalize_text(x) for x in EXCLUDED_SECTORS}
     enriched_rows = []
 
+    reset_yfinance_session()
+    log("INFO session reset before fetch loop")
+
     for i, row in enumerate(input_rows, start=1):
         # SESSION_RESET_EVERY件ごとにセッションをリセット（初回除く）
         if i > 1 and (i - 1) % SESSION_RESET_EVERY == 0:
@@ -1070,9 +1072,9 @@ def main() -> None:
 
     log(f"INFO sheet write range={write_range} rows={len(output_rows)}")
     ws.batch_clear(["D2:S"])
-    ws.update(write_range, output_rows, value_input_option="USER_ENTERED")
-    ws.update(cache_header_range, [CACHE_HEADERS], value_input_option="USER_ENTERED")
-    ws.update(cache_write_range, cache_rows, value_input_option="USER_ENTERED")
+    ws.update(values=output_rows, range_name=write_range, value_input_option="USER_ENTERED")
+    ws.update(values=[CACHE_HEADERS], range_name=cache_header_range, value_input_option="USER_ENTERED")
+    ws.update(values=cache_rows, range_name=cache_write_range, value_input_option="USER_ENTERED")
 
     status_summary = summarize_status_counts(enriched_rows if train_n >= MIN_TRAIN_N else df.to_dict("records"))
     if pd.isna(model_r2):
