@@ -191,7 +191,7 @@ def load_config() -> dict:
 
 def open_worksheet(config: dict):
     gc = gspread.service_account_from_dict(config["gcp_service_account_json"])
-    sh = gc.open_by_url(config["sheet_url"])
+    sh = call_with_retry(gc.open_by_url, config["sheet_url"])
     return sh.worksheet(config["worksheet_name"])
 
 
