@@ -1071,7 +1071,7 @@ def main() -> None:
     cache_write_range = f"{rowcol_to_a1(start_row, CACHE_START_COL)}:{rowcol_to_a1(end_row, cache_end_col)}"
 
     log(f"INFO sheet write range={write_range} rows={len(output_rows)}")
-    ws.batch_clear(["D2:S"])
+    call_with_retry(ws.batch_clear, ["D2:S"])
     ws.update(values=output_rows, range_name=write_range, value_input_option="USER_ENTERED")
     ws.update(values=[CACHE_HEADERS], range_name=cache_header_range, value_input_option="USER_ENTERED")
     ws.update(values=cache_rows, range_name=cache_write_range, value_input_option="USER_ENTERED")
